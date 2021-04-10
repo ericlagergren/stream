@@ -28,6 +28,7 @@ const (
 	eofIdx          = nonceSize - 1
 	ctrIdx          = nonceSize - 5
 	noncePrefixSize = nonceSize - 5
+	headerSize      = len(version{}) + saltSize + noncePrefixSize
 )
 
 type version [4]byte
@@ -77,6 +78,7 @@ func NewWriter(w io.Writer, key []byte) (io.WriteCloser, error) {
 		return nil, err
 	}
 	return &writer{
+		w:         w,
 		aead:      aead,
 		nonce:     nonce,
 		plaintext: make([]byte, ChunkSize),
@@ -90,8 +92,6 @@ type writer struct {
 	aead cipher.AEAD
 	// nonce is the incrementing nonce.
 	nonce []byte
-	// ctr is the current chunk counter.
-	ctr int
 	// plaintext contains ChunkSize bytes of plaintext data.
 	//
 	// plaintext is flushed when full or when Close is called.
@@ -112,7 +112,7 @@ func (w *writer) Write(p []byte) (int, error) {
 	for len(p) > 0 && w.err == nil {
 		// Flush before copying to avoid writing a zero-sized
 		// record at EOF.
-		if w.n >= ChunkSize {
+		if w.n == ChunkSize {
 			w.flush(false)
 		}
 		n := copy(w.plaintext[w.n:], p)
@@ -149,8 +149,10 @@ func (w *writer) flush(eof bool) {
 		err = io.ErrShortWrite
 	}
 	w.err = err
-	setNonce(w.nonce, w.ctr)
-	w.ctr++
+	w.n = 0
+	if !eof {
+		incrNonce(w.nonce)
+	}
 }
 
 // NewReader creates a ReadCloser that reads plaintext from r.
@@ -198,8 +200,6 @@ type reader struct {
 	aead cipher.AEAD
 	// nonce is the incrementing nonce.
 	nonce []byte
-	// ctr is the current chunk counter.
-	ctr int
 	// plaintext contains unread decrypted data.
 	//
 	// Sized on the first decryption.
@@ -224,7 +224,7 @@ func (r *reader) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 
-	if len(r.plaintext) > 0 && (r.err == nil || r.err != io.EOF) {
+	if r.n < len(r.plaintext) && (r.err == nil || r.err != io.EOF) {
 		n := copy(p, r.plaintext[r.n:])
 		r.n += n
 		return n, nil
@@ -238,9 +238,9 @@ func (r *reader) Read(p []byte) (int, error) {
 
 	n, err := io.ReadFull(r.r, r.ciphertext)
 	switch err {
-	case nil:
-		// OK We manually set EOF, so we'll only ever receive EOF
-		// here if the ciphertext is indeed truncated.
+	// We manually set EOF upon seeing a terminal chunk, so we'll
+	// only ever receive EOF here if the ciphertext is indeed
+	// truncated.
 	case io.EOF:
 		return 0, io.ErrUnexpectedEOF
 	// Reading a partial chunk means this is either the final
@@ -249,6 +249,8 @@ func (r *reader) Read(p []byte) (int, error) {
 	case io.ErrUnexpectedEOF:
 		setEOF(r.nonce)
 		eof = true
+	case nil:
+		// OK
 	default:
 		return 0, err
 	}
@@ -272,12 +274,11 @@ func (r *reader) Read(p []byte) (int, error) {
 	if eof {
 		r.err = io.EOF
 	} else {
-		r.ctr++
-		setNonce(r.nonce, r.ctr)
+		incrNonce(r.nonce)
 	}
 
 	r.n = copy(p, r.plaintext)
-	return r.n, err
+	return r.n, r.err
 }
 
 var (
@@ -295,27 +296,28 @@ func derive(ikm, salt []byte) []byte {
 	return key
 }
 
-// setNonce sets nonce's counter to n for n in [0, 1<<32-1].
+// incrNonce sets nonce's counter to n for n in [0, 1<<32-1].
 //
 // If nonce is not the correct size or the EOF byte is already
-// set, setNonce panics.
-func setNonce(nonce []byte, n int) {
+// set, incrNonce panics.
+func incrNonce(nonce []byte) {
 	if len(nonce) != nonceSize {
 		panic("stream: invalid nonce size: " + strconv.Itoa(len(nonce)))
-	}
-	if n < 0 || n > math.MaxUint32 {
-		panic("stream: counter out of range")
 	}
 	if nonce[eofIdx] != 0 {
 		panic("stream: EOF already set")
 	}
-	binary.BigEndian.PutUint32(nonce[ctrIdx:eofIdx], uint32(n))
+	n := binary.BigEndian.Uint32(nonce[ctrIdx:eofIdx])
+	if n == math.MaxUint32 {
+		panic("stream: counter out of range")
+	}
+	binary.BigEndian.PutUint32(nonce[ctrIdx:eofIdx], n+1)
 }
 
 // setEOF sets the EOF byte
 //
 // If nonce is not the correct size or the EOF byte is already
-// set, setNonce panics.
+// set, incrNonce panics.
 func setEOF(nonce []byte) {
 	if len(nonce) != nonceSize {
 		panic("stream: invalid nonce size: " + strconv.Itoa(len(nonce)))
