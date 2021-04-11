@@ -1,4 +1,37 @@
 // Package stream implements OAE2 STREAM.
+//
+// OAE stands for Online Authenticated Encryption. Here, the term
+// "online" means plaintext and ciphertext can be encrypted and
+// decrypted, respectively, with one left-to-right pass. In other
+// words, it supports streaming [stream].
+//
+// OAE2 is a simple construction: the plaintext is broken into
+// chunks and each chunk is encrypted separately. A counter nonce
+// is used to ensure unique nonces and to provider ordering.
+//
+// This package implements STREAM using XChaCha20-Poly1305. Each
+// plaintext chunk_n in {0, 1, ..., N-2} is exactly 64 KiB with
+// the final plaintext chunk_{N-1} being an arbitrary size less
+// than or equal to 64 KiB. In other words, every chunk is the
+// same size, except the final chunk may be a smaller.
+//
+// Borrowing from Hoang and Shen [tink], this package adds
+// a random prefix to the nonces, increasing the concrete
+// security bound. More specifically:
+//
+//    prefix counter eof
+//      152    32     8  bits
+//
+// The EOF byte signals the end of the stream. Without an
+// explicit EOF signal the stream could be susceptible to
+// truncation attacks.
+//
+// As always, it is not a good idea to act on a plaintext until
+// the entire message has been verified.
+//
+// [stream]: https://eprint.iacr.org/2015/189.pdf
+// [tink]: https://eprint.iacr.org/2020/1019.pdf
+//
 package stream
 
 import (
