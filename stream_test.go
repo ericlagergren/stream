@@ -2,15 +2,23 @@ package stream
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	mrand "math/rand"
+
+	"github.com/ericlagergren/stream/internal/golden"
 )
+
+// TODO(eric): add AD, info tests
 
 func randKey() []byte {
 	key := make([]byte, keySize)
@@ -101,6 +109,7 @@ func TestModified(t *testing.T) {
 	}
 
 	buf := ciphertext.Bytes()
+	buf = buf[headerSize:]
 	buf[mrand.Intn(len(buf))]++
 
 	r, err := NewReader(&ciphertext, key)
@@ -244,6 +253,54 @@ func TestTruncated(t *testing.T) {
 	_, err = io.Copy(&got, r)
 	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// TestGolden tests against known test vectors.
+func TestGolden(t *testing.T) {
+	f, err := os.Open(filepath.Join("testdata", "golden.gob.gz"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+
+	gzr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { gzr.Close() })
+
+	dec := gob.NewDecoder(gzr)
+	for i := 0; ; i++ {
+		var v golden.Vector
+		err := dec.Decode(&v)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("#%d: %v", i, err)
+		}
+		rng, err := golden.CSPRNG(v.Seed)
+		if err != nil {
+			t.Fatalf("#%d: %v", i, err)
+		}
+		key := make([]byte, keySize)
+		_, err = io.ReadFull(rng, key)
+		if err != nil {
+			t.Fatalf("#%d: %v", i, err)
+		}
+		r, err := NewReader(bytes.NewReader(v.Ciphertext), key)
+		if err != nil {
+			t.Fatalf("#%d: %v", i, err)
+		}
+		var got bytes.Buffer
+		_, err = io.Copy(&got, r)
+		if err != nil {
+			t.Fatalf("#%d: %v", i, err)
+		}
+		if !bytes.Equal(got.Bytes(), v.Plaintext) {
+			t.Fatalf("#%d: %v", i, diff(got.Bytes(), v.Plaintext))
+		}
 	}
 }
 

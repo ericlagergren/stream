@@ -2,8 +2,8 @@
 //
 // OAE stands for Online Authenticated Encryption. Here, the term
 // "online" means plaintext and ciphertext can be encrypted and
-// decrypted, respectively, with one left-to-right pass. In other
-// words, it supports streaming [stream].
+// decrypted, respectively, with one left-to-right pass [stream].
+// In other words, it supports streaming.
 //
 // OAE2 is a simple construction: the plaintext is broken into
 // chunks and each chunk is encrypted separately. A counter nonce
@@ -29,8 +29,11 @@
 // As always, it is not a good idea to act on a plaintext until
 // the entire message has been verified.
 //
-// [stream]: https://eprint.iacr.org/2015/189.pdf
-// [tink]: https://eprint.iacr.org/2020/1019.pdf
+// References:
+//
+//    [stream]: https://eprint.iacr.org/2015/189.pdf
+//    [tink]: https://eprint.iacr.org/2020/1019.pdf
+//    [hkdf]: https://tools.ietf.org/html/rfc5869
 //
 package stream
 
@@ -64,14 +67,76 @@ const (
 	headerSize      = len(version{}) + saltSize + noncePrefixSize
 )
 
+// version identifies the encryption scheme used.
+//
+// TODO(eric): get rid of this, I'm not sure I like it.
 type version [4]byte
 
 var (
 	v0 = [4]byte{0, 0, 0, 1}
 )
 
+type option struct {
+	// rand supplies randomness to NewWriter.
+	rand io.Reader
+	// aditionalData is the AD passed to each encryption.
+	additionalData []byte
+	// info is the HKDF 'info' parameter.
+	info []byte
+}
+
+// Option configures NewReader and NewWriter.
+type Option func(*option)
+
+// WithAdditionalData sets additional authenticated data used in
+// each encryption.
+//
+// Additional data is typically used to bind the ciphertext to
+// a particular contect.
+//
+// By default, no additional data is used.
+func WithAdditionalData(data []byte) Option {
+	return func(o *option) {
+		o.additionalData = data
+	}
+}
+
+// WithInfo sets the HKDF 'info' parameter used when deriving the
+// encryption key.
+//
+// The info parameter is typically used to bind the key to
+// a particular context [hkdf].
+//
+// By default, the info parameter is not used.
+func WithInfo(info []byte) Option {
+	return func(o *option) {
+		o.info = info
+	}
+}
+
+// WithRand sets the Reader that supplies randomness to
+// NewWriter.
+//
+// By default, rand.Reader is used.
+func WithRand(r io.Reader) Option {
+	return func(o *option) {
+		o.rand = r
+	}
+}
+
 // NewWriter creates a WriteCloser that writes ciphertext to w.
-func NewWriter(w io.Writer, key []byte) (io.WriteCloser, error) {
+//
+// NewWriter derives the actual encryption key with HKDF.
+//
+// In general, it is unsafe to reuse a key.
+func NewWriter(w io.Writer, key []byte, opts ...Option) (io.WriteCloser, error) {
+	o := option{
+		rand: rand.Reader,
+	}
+	for _, fn := range opts {
+		fn(&o)
+	}
+
 	n, err := w.Write(v0[:])
 	if n < len(v0) && err == nil {
 		err = io.ErrShortWrite
@@ -81,7 +146,7 @@ func NewWriter(w io.Writer, key []byte) (io.WriteCloser, error) {
 	}
 
 	salt := make([]byte, 32)
-	_, err = rand.Read(salt)
+	_, err = io.ReadFull(o.rand, salt)
 	if err != nil {
 		return nil, err
 	}
@@ -94,7 +159,7 @@ func NewWriter(w io.Writer, key []byte) (io.WriteCloser, error) {
 	}
 
 	nonce := make([]byte, nonceSize)
-	_, err = rand.Read(nonce[:noncePrefixSize])
+	_, err = io.ReadFull(o.rand, nonce[:noncePrefixSize])
 	if err != nil {
 		return nil, err
 	}
@@ -106,15 +171,16 @@ func NewWriter(w io.Writer, key []byte) (io.WriteCloser, error) {
 		return nil, err
 	}
 
-	aead, err := chacha20poly1305.NewX(derive(key, salt))
+	aead, err := chacha20poly1305.NewX(derive(key, salt, o.info))
 	if err != nil {
 		return nil, err
 	}
 	return &writer{
-		w:         w,
-		aead:      aead,
-		nonce:     nonce,
-		plaintext: make([]byte, ChunkSize),
+		w:              w,
+		aead:           aead,
+		additionalData: o.additionalData,
+		nonce:          nonce,
+		plaintext:      make([]byte, ChunkSize),
 	}, nil
 }
 
@@ -123,6 +189,8 @@ type writer struct {
 	w io.Writer
 	// aead is the in-use cipher.
 	aead cipher.AEAD
+	// aditionalData is the AD passed to each encryption.
+	additionalData []byte
 	// nonce is the incrementing nonce.
 	nonce []byte
 	// plaintext contains ChunkSize bytes of plaintext data.
@@ -176,7 +244,8 @@ func (w *writer) flush(eof bool) {
 	if eof {
 		setEOF(w.nonce)
 	}
-	ciphertext := w.aead.Seal(nil, w.nonce, w.plaintext[:w.n], nil)
+	ciphertext := w.aead.Seal(
+		nil, w.nonce, w.plaintext[:w.n], w.additionalData)
 	n, err := w.w.Write(ciphertext)
 	if n < len(ciphertext) && err == nil {
 		err = io.ErrShortWrite
@@ -189,7 +258,12 @@ func (w *writer) flush(eof bool) {
 }
 
 // NewReader creates a ReadCloser that reads plaintext from r.
-func NewReader(r io.Reader, key []byte) (io.Reader, error) {
+func NewReader(r io.Reader, key []byte, opts ...Option) (io.Reader, error) {
+	o := option{}
+	for _, fn := range opts {
+		fn(&o)
+	}
+
 	var vers version
 	_, err := io.ReadFull(r, vers[:])
 	if err != nil {
@@ -214,15 +288,16 @@ func NewReader(r io.Reader, key []byte) (io.Reader, error) {
 		return nil, err
 	}
 
-	aead, err := chacha20poly1305.NewX(derive(key, salt))
+	aead, err := chacha20poly1305.NewX(derive(key, salt, o.info))
 	if err != nil {
 		return nil, err
 	}
 	return &reader{
-		r:          r,
-		aead:       aead,
-		nonce:      nonce,
-		ciphertext: make([]byte, ChunkSize+overhead),
+		r:              r,
+		aead:           aead,
+		additionalData: o.additionalData,
+		nonce:          nonce,
+		ciphertext:     make([]byte, ChunkSize+overhead),
 	}, nil
 }
 
@@ -231,6 +306,8 @@ type reader struct {
 	r io.Reader
 	// aead is the in-use cipher.
 	aead cipher.AEAD
+	// aditionalData is the AD passed to each encryption.
+	additionalData []byte
 	// nonce is the incrementing nonce.
 	nonce []byte
 	// plaintext contains unread decrypted data.
@@ -257,7 +334,7 @@ func (r *reader) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 
-	if r.n < len(r.plaintext) && (r.err == nil || r.err != io.EOF) {
+	if r.n < len(r.plaintext) && (r.err == nil || r.err == io.EOF) {
 		n := copy(p, r.plaintext[r.n:])
 		r.n += n
 		return n, nil
@@ -289,7 +366,7 @@ func (r *reader) Read(p []byte) (int, error) {
 	}
 
 	r.plaintext, r.err = r.aead.Open(
-		r.plaintext[:0], r.nonce, r.ciphertext[:n], nil)
+		r.plaintext[:0], r.nonce, r.ciphertext[:n], r.additionalData)
 	if err != nil && !eof {
 		// If the size of the plaintext is a multiple of
 		// ChunkSize then the final chunk will have err == nil,
@@ -298,7 +375,7 @@ func (r *reader) Read(p []byte) (int, error) {
 		setEOF(r.nonce)
 		eof = true
 		r.plaintext, r.err = r.aead.Open(
-			r.plaintext[:0], r.nonce, r.ciphertext[:n], nil)
+			r.plaintext[:0], r.nonce, r.ciphertext[:n], r.additionalData)
 	}
 	if r.err != nil {
 		return 0, r.err
@@ -311,17 +388,13 @@ func (r *reader) Read(p []byte) (int, error) {
 	}
 
 	r.n = copy(p, r.plaintext)
-	return r.n, r.err
+	return r.n, nil
 }
 
-var (
-	keyInfo = []byte("stream key")
-)
-
 // derive computes HKDF(ikm, salt) and returns a new 256-bit key.
-func derive(ikm, salt []byte) []byte {
+func derive(ikm, salt, info []byte) []byte {
 	key := make([]byte, keySize)
-	r := hkdf.New(sha256.New, ikm, salt, keyInfo)
+	r := hkdf.New(sha256.New, ikm, salt, info)
 	_, err := io.ReadFull(r, key)
 	if err != nil {
 		panic(err)
