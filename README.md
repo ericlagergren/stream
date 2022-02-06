@@ -1,5 +1,7 @@
 # stream
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/ericlagergren/stream.svg)](https://pkg.go.dev/github.com/ericlagergren/stream)
+
 The [OAE2 STREAM](https://eprint.iacr.org/2015/189.pdf) algorithm.
 
 ## Security
