@@ -50,21 +50,14 @@ import (
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
-	"golang.org/x/crypto/poly1305"
 )
 
 const (
 	// ChunkSize is the size of a plaintext chunk.
 	ChunkSize = 1 << 16
 
-	overhead        = poly1305.TagSize
-	keySize         = chacha20poly1305.KeySize
-	saltSize        = 32
-	nonceSize       = chacha20poly1305.NonceSizeX
-	eofIdx          = nonceSize - 1
-	ctrIdx          = nonceSize - 5
-	noncePrefixSize = nonceSize - 5
-	headerSize      = len(version{}) + saltSize + noncePrefixSize
+	keySize  = 32
+	saltSize = 32
 )
 
 // version identifies the encryption scheme used.
@@ -83,6 +76,8 @@ type option struct {
 	additionalData []byte
 	// info is the HKDF 'info' parameter.
 	info []byte
+	// aead returns the AEAD uses.
+	aead func([]byte) (cipher.AEAD, error)
 }
 
 // Option configures NewReader and NewWriter.
@@ -124,6 +119,16 @@ func WithRand(r io.Reader) Option {
 	}
 }
 
+// WithAEAD specifies the AEAD function, which must accept
+// a 32-byte key.
+//
+// By default, XChaCha-Poly1305 is used.
+func WithAEAD(fn func([]byte) (cipher.AEAD, error)) Option {
+	return func(o *option) {
+		o.aead = fn
+	}
+}
+
 // NewWriter creates a WriteCloser that writes ciphertext to w.
 //
 // NewWriter derives the actual encryption key with HKDF.
@@ -135,6 +140,9 @@ func NewWriter(w io.Writer, key []byte, opts ...Option) (io.WriteCloser, error) 
 	}
 	for _, fn := range opts {
 		fn(&o)
+	}
+	if o.aead == nil {
+		o.aead = chacha20poly1305.NewX
 	}
 
 	n, err := w.Write(v0[:])
@@ -158,7 +166,13 @@ func NewWriter(w io.Writer, key []byte, opts ...Option) (io.WriteCloser, error) 
 		return nil, err
 	}
 
-	nonce := make([]byte, nonceSize)
+	aead, err := o.aead(derive(key, salt, o.info))
+	if err != nil {
+		return nil, err
+	}
+	noncePrefixSize := aead.NonceSize() - 5
+
+	nonce := make([]byte, aead.NonceSize())
 	_, err = io.ReadFull(o.rand, nonce[:noncePrefixSize])
 	if err != nil {
 		return nil, err
@@ -167,11 +181,6 @@ func NewWriter(w io.Writer, key []byte, opts ...Option) (io.WriteCloser, error) 
 	if n < noncePrefixSize && err == nil {
 		err = io.ErrShortWrite
 	}
-	if err != nil {
-		return nil, err
-	}
-
-	aead, err := chacha20poly1305.NewX(derive(key, salt, o.info))
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +251,7 @@ func (w *writer) flush(eof bool) {
 		return
 	}
 	if eof {
-		setEOF(w.nonce)
+		setEOF(w.aead, w.nonce)
 	}
 	ciphertext := w.aead.Seal(
 		nil, w.nonce, w.plaintext[:w.n], w.additionalData)
@@ -253,7 +262,7 @@ func (w *writer) flush(eof bool) {
 	w.err = err
 	w.n = 0
 	if !eof {
-		incrNonce(w.nonce)
+		incrNonce(w.aead, w.nonce)
 	}
 }
 
@@ -262,6 +271,9 @@ func NewReader(r io.Reader, key []byte, opts ...Option) (io.Reader, error) {
 	o := option{}
 	for _, fn := range opts {
 		fn(&o)
+	}
+	if o.aead == nil {
+		o.aead = chacha20poly1305.NewX
 	}
 
 	var vers version
@@ -282,13 +294,14 @@ func NewReader(r io.Reader, key []byte, opts ...Option) (io.Reader, error) {
 		return nil, err
 	}
 
-	nonce := make([]byte, nonceSize)
-	_, err = io.ReadFull(r, nonce[:noncePrefixSize])
+	aead, err := o.aead(derive(key, salt, o.info))
 	if err != nil {
 		return nil, err
 	}
+	noncePrefixSize := aead.NonceSize() - 5
 
-	aead, err := chacha20poly1305.NewX(derive(key, salt, o.info))
+	nonce := make([]byte, aead.NonceSize())
+	_, err = io.ReadFull(r, nonce[:noncePrefixSize])
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +310,7 @@ func NewReader(r io.Reader, key []byte, opts ...Option) (io.Reader, error) {
 		aead:           aead,
 		additionalData: o.additionalData,
 		nonce:          nonce,
-		ciphertext:     make([]byte, ChunkSize+overhead),
+		ciphertext:     make([]byte, ChunkSize+aead.Overhead()),
 	}, nil
 }
 
@@ -318,7 +331,7 @@ type reader struct {
 	n int
 	// ciphertext is a scratch buffer for reading data.
 	//
-	// Sized to ChunkSize+overhead by NewReader.
+	// Sized to ChunkSize+aead.Overhead by NewReader.
 	ciphertext []byte
 	// err is any error that occurs while reading or decrypting
 	// data.
@@ -357,7 +370,7 @@ func (r *reader) Read(p []byte) (int, error) {
 	// chunk or the ciphertext was truncated. In either case,
 	// this is the terminal chunk.
 	case io.ErrUnexpectedEOF:
-		setEOF(r.nonce)
+		setEOF(r.aead, r.nonce)
 		eof = true
 	case nil:
 		// OK
@@ -372,7 +385,7 @@ func (r *reader) Read(p []byte) (int, error) {
 		// ChunkSize then the final chunk will have err == nil,
 		// and so decryption will fail. Try again with the EOF
 		// byte set.
-		setEOF(r.nonce)
+		setEOF(r.aead, r.nonce)
 		eof = true
 		r.plaintext, r.err = r.aead.Open(
 			r.plaintext[:0], r.nonce, r.ciphertext[:n], r.additionalData)
@@ -384,7 +397,7 @@ func (r *reader) Read(p []byte) (int, error) {
 	if eof {
 		r.err = io.EOF
 	} else {
-		incrNonce(r.nonce)
+		incrNonce(r.aead, r.nonce)
 	}
 
 	r.n = copy(p, r.plaintext)
@@ -406,13 +419,15 @@ func derive(ikm, salt, info []byte) []byte {
 //
 // If nonce is not the correct size or the EOF byte is already
 // set, incrNonce panics.
-func incrNonce(nonce []byte) {
-	if len(nonce) != nonceSize {
+func incrNonce(a cipher.AEAD, nonce []byte) {
+	if len(nonce) != a.NonceSize() {
 		panic("stream: invalid nonce size: " + strconv.Itoa(len(nonce)))
 	}
+	eofIdx := a.NonceSize() - 1
 	if nonce[eofIdx] != 0 {
 		panic("stream: EOF already set")
 	}
+	ctrIdx := a.NonceSize() - 5
 	n := binary.BigEndian.Uint32(nonce[ctrIdx:eofIdx])
 	if n == math.MaxUint32 {
 		panic("stream: counter out of range")
@@ -424,10 +439,11 @@ func incrNonce(nonce []byte) {
 //
 // If nonce is not the correct size or the EOF byte is already
 // set, incrNonce panics.
-func setEOF(nonce []byte) {
-	if len(nonce) != nonceSize {
+func setEOF(a cipher.AEAD, nonce []byte) {
+	if len(nonce) != a.NonceSize() {
 		panic("stream: invalid nonce size: " + strconv.Itoa(len(nonce)))
 	}
+	eofIdx := a.NonceSize() - 1
 	if nonce[eofIdx] != 0 {
 		panic("stream: EOF already set")
 	}

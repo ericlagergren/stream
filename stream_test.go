@@ -3,6 +3,8 @@ package stream
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/rand"
 	"encoding/gob"
 	"errors"
@@ -16,6 +18,7 @@ import (
 	mrand "math/rand"
 
 	"github.com/ericlagergren/stream/internal/golden"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // TODO(eric): add AD, info tests
@@ -108,6 +111,7 @@ func TestModified(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	headerSize := len(version{}) + saltSize + w.(*writer).aead.NonceSize() - 5
 	buf := ciphertext.Bytes()
 	buf = buf[headerSize:]
 	buf[mrand.Intn(len(buf))]++
@@ -190,18 +194,21 @@ func TestBadNonce(t *testing.T) {
 
 	buf := ciphertext.Bytes()
 
+	aead := w.(*writer).aead
+	headerSize := len(version{}) + saltSize + aead.NonceSize() - 5
 	// Trim header and all but final chunk.
 	buf = buf[headerSize:]
-	buf = buf[len(buf)/(ChunkSize+overhead):]
+	buf = buf[len(buf)/(ChunkSize+aead.Overhead()):]
 
+	eofIdx := aead.NonceSize() - 1
 	// Extract the nonce and set its counter to N+1 (i.e., the
 	// would-be next chunk's nonce).
-	nonce := buf[:nonceSize]
+	nonce := buf[:aead.NonceSize()]
 	// Store, clear, then reset the EOF byte since setNonce will
 	// panic if called on a nonce where EOF is set.
 	eof := nonce[eofIdx]
 	nonce[eofIdx] = 0
-	incrNonce(nonce)
+	incrNonce(aead, nonce)
 	nonce[eofIdx] = eof
 
 	r, err := NewReader(&ciphertext, key)
@@ -242,7 +249,9 @@ func TestTruncated(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ciphertext.Truncate(headerSize + (N-1)*(ChunkSize+overhead))
+	aead := w.(*writer).aead
+	headerSize := len(version{}) + saltSize + aead.NonceSize() - 5
+	ciphertext.Truncate(headerSize + (N-1)*(ChunkSize+aead.Overhead()))
 
 	r, err := NewReader(&ciphertext, key)
 	if err != nil {
@@ -304,7 +313,22 @@ func TestGolden(t *testing.T) {
 	}
 }
 
-func BenchmarkReader(b *testing.B) {
+func BenchmarkReaderAESGCM(b *testing.B) {
+	fn := func(key []byte) (cipher.AEAD, error) {
+		b, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		return cipher.NewGCM(b)
+	}
+	benchmarkReader(b, fn)
+}
+
+func BenchmarkReaderChaCha20Poly1305(b *testing.B) {
+	benchmarkReader(b, chacha20poly1305.NewX)
+}
+
+func benchmarkReader(b *testing.B, fn func([]byte) (cipher.AEAD, error)) {
 	var (
 		ciphertext []byte
 		key        = randKey()
