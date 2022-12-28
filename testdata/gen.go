@@ -1,4 +1,4 @@
-// +build ignore
+//go:build ignore
 
 package main
 
@@ -6,7 +6,7 @@ import (
 	"archive/zip"
 	"compress/gzip"
 	"crypto/rand"
-	"encoding/gob"
+	"encoding/json"
 	"io"
 	"os"
 
@@ -36,7 +36,7 @@ func main1() error {
 		return err
 	}
 
-	out, err := os.Create("golden.gob.gz")
+	out, err := os.Create("golden.json.gz")
 	if err != nil {
 		return err
 	}
@@ -48,7 +48,7 @@ func main1() error {
 	}
 	defer gzw.Close()
 
-	enc := gob.NewEncoder(gzw)
+	enc := json.NewEncoder(gzw)
 
 	for _, f := range r.File {
 		seed := make([]byte, 32)

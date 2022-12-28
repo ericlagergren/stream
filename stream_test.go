@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"crypto/rand"
-	"encoding/gob"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -258,7 +258,7 @@ func TestTruncated(t *testing.T) {
 
 // TestGolden tests against known test vectors.
 func TestGolden(t *testing.T) {
-	f, err := os.Open(filepath.Join("testdata", "golden.gob.gz"))
+	f, err := os.Open(filepath.Join("testdata", "golden.json.gz"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,7 +270,7 @@ func TestGolden(t *testing.T) {
 	}
 	t.Cleanup(func() { gzr.Close() })
 
-	dec := gob.NewDecoder(gzr)
+	dec := json.NewDecoder(gzr)
 	for i := 0; ; i++ {
 		var v golden.Vector
 		err := dec.Decode(&v)
